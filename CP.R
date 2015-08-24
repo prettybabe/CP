@@ -9,6 +9,7 @@ library("rCharts", lib.loc="~/R/win-library/3.1")
 library("ggplot2", lib.loc="~/R/win-library/3.1")
 library("lubridate", lib.loc="~/R/win-library/3.1")
 load("D:/working/GetData/IndustryWeeklyReturn.RData")
+load("D:/working/CP/Data.RData")
 ##################################################################################################
 # 下载需要的数据
 
@@ -22,10 +23,11 @@ data$ReturnDaily <- tbl(channel, "ReturnDaily") %>%
   mutate(TradingDay = as.Date(TradingDay))
 
 nIndexCode <- 4982
-data$SecuMainIndex <- tbl(channel, "SecuMain") %>%
-  filter(InnerCode == nIndexCode) %>%
-  select(InnerCode, CompanyCode, SecuCode, SecuAbbr) %>%
-  collect 
+data$SecuMainIndex <- tbl(channel, "QT_IndexQuote") %>%
+  filter(InnerCode %in% c(3145, 4978, 4982)) %>%
+  select(InnerCode, TradingDay, PrevClosePrice, ClosePrice) %>%
+  collect %>%
+  mutate(TradingDay = as.Date(TradingDay))
 
 data$IndexComponent <- tbl(channel, "LC_IndexComponent") %>%
   select(IndexInnerCode, SecuInnerCode, InDate, OutDate) %>%
@@ -61,7 +63,7 @@ trading_date <- data$TradingDay %>%
   na.omit()
 
 ###################################################################################################
-industry_cp_data <- data.frame()
+industry_cp  <- data.frame()
 for(i in c(1:nrow(trading_date))){
   start <- trading_date[[i, 1]]
   end <- trading_date[[i, 2]]
@@ -69,7 +71,9 @@ for(i in c(1:nrow(trading_date))){
     filter(TradingDay == start) %>% # 筛选日期
     semi_join(data$IndexComponent %>% 
                 filter(IndexInnerCode == nIndexCode, start >= InDate & start < OutDate),
-              by = c("InnerCode" = "SecuInnerCode")) 
+              by = c("InnerCode" = "SecuInnerCode")) %>% 
+    mutate(SecuCode = ifelse(SecuCode == '600849', '601607', SecuCode)) %>% 
+    arrange(InnerCode)
   
   industry_cp_temp <- temp %>%
     inner_join(data$CashFlow %>% filter(DataDate == start),
@@ -81,41 +85,40 @@ for(i in c(1:nrow(trading_date))){
     group_by(TradingDay, IndustryNameNew) %>%
     summarise(IndustryCP = weighted.mean(CPS, FloatMarketCap)) %>%
     ungroup() 
-  
-  stock_return_temp <- temp %>%
-    inner_join(data$ReturnDaily %>% 
-                filter(TradingDay > start,  TradingDay <= end) %>%
-                 select(InnerCode, DailyReturn), by = "InnerCode") %>% 
-    group_by(InnerCode, FloatMarketCap, IndustryNameNew) %>% 
-    summarise(StockReturn = expm1(sum(log1p(DailyReturn.y)))) %>%
-    ungroup()
-  
-  industry_return_temp <- stock_return_temp %>%
-    group_by(IndustryNameNew) %>%
-    summarise(UnSespendedFloatMarketCap = sum(FloatMarketCap)) %>% 
-    inner_join(stock_return_temp %>% semi_join(temp %>% filter(IfSuspended == 0), by = "InnerCode"),
-               by = "IndustryNameNew") %>%
-    group_by(IndustryNameNew, UnSespendedFloatMarketCap) %>% 
-    summarise(IndustryReturn = weighted.mean(StockReturn, FloatMarketCap),
-              SespendedFloatMarketCap = sum(FloatMarketCap)) %>%
-    ungroup()
-  
-  industry_cp_data_temp <- industry_cp_temp %>% 
-    inner_join(industry_return_temp, by = "IndustryNameNew")
-  
-  industry_cp_data <- rbind(industry_cp_data, industry_cp_data_temp)
+
+  industry_cp <- rbind(industry_cp, industry_cp_temp)
 }
+
+industry_cp_data <- industry_cp %>% 
+  inner_join(industry_weekly_return, by = c("TradingDay", "IndustryNameNew"))
 
 ggplot(industry_cp_data, aes(x = IndustryNameNew, y = IndustryCP)) +
   geom_boxplot() + 
   xlab(NULL) +
   ylab(NULL) +
-  ggtitle(("Industry EP"))
+  ggtitle(("Industry CP"))
+
+##################################################################################################
+index_weekly_return <- data.frame()
+for(i in c(1:nrow(trading_date))){
+  start <- trading_date[[i, 1]]
+  end <- trading_date[[i, 2]]
+  index_weekly_return_temp <- data$SecuMainIndex %>% 
+    filter(TradingDay > start & TradingDay <= end) %>% 
+    group_by(InnerCode) %>% 
+    summarise(IndexWeeklyReturn = expm1(sum(log(ClosePrice/PrevClosePrice)))) %>% 
+    mutate(TradingDay = start)
+  
+  index_weekly_return <- rbind(index_weekly_return, index_weekly_return_temp)
+}
+index_weekly_return <- index_weekly_return %>% 
+  dcast(TradingDay ~ InnerCode, value.var = 'IndexWeeklyReturn') 
+names(index_weekly_return) <- c("TradingDay", "CSI300", "CSI500", "CSI800")
 
 ##################################################################################################
 
 half_life <- 100
-industry_number <- 6
+industry_number <- 1
 portfolio <- industry_cp_data %>%
   group_by(IndustryNameNew) %>%
   arrange(TradingDay) %>%
@@ -136,9 +139,38 @@ portfolio <- industry_cp_data %>%
   melt(id = c("TradingDay"), measure = c("Equal", "Sespended", "UnSespended"))
 
 ggplot(portfolio, aes(x = TradingDay, y =  value, color = variable)) + geom_line() +
+  ggtitle(paste(valuename, " half_life ", half_life, "industry_number ", industry_number)) + 
+  xlab(NULL) + ylab(NULL) 
+
+
+##################################################################################################
+
+half_life <- 100
+industry_number <- 1
+portfolio_index <- industry_cp_data %>%
+  group_by(IndustryNameNew) %>%
+  arrange(TradingDay) %>%
+  mutate(IndustryValueScore =  Score(IndustryCP, half_life)) %>%
+  filter(!is.na(IndustryValueScore)) %>%
+  group_by(TradingDay) %>%
+  arrange(desc(IndustryValueScore)) %>% 
+  slice(c(1:industry_number)) %>%
+  group_by(TradingDay) %>%
+  summarise(Sespended = weighted.mean(IndustryReturn, SespendedFloatMarketCap)) %>%
+  inner_join(index_weekly_return, by = "TradingDay") %>%
+  arrange(TradingDay) %>%
+  mutate(Sespended_CSI300 = expm1(cumsum(log1p(Sespended - CSI300))),
+         Sespended_CSI500 = expm1(cumsum(log1p(Sespended - CSI500))),
+         Sespended_CSI800 = expm1(cumsum(log1p(Sespended - CSI800))),
+         Sespended = expm1(cumsum(log1p(Sespended)))) %>%
+  ungroup() %>% 
+  melt(id = c("TradingDay"), measure = c("Sespended", "Sespended_CSI300", 
+                                         "Sespended_CSI500", "Sespended_CSI800"))
+
+ggplot(portfolio_index, aes(x = TradingDay, y =  value, color = variable)) + geom_line() +
         ggtitle(paste(valuename, half_life, "industry_number ", industry_number)) +
         xlab(NULL) + ylab(NULL) 
 
 
 ###########################################################################################
-IndustryShow(industry_cp_data, half_life = 100, "cp")
+IndustryShow(industry_cp_data, half_life = 75, "cp")
